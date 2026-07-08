@@ -47,6 +47,7 @@ Open `http://localhost:8080/stream` to access the raw M-JPEG stream (useful in e
 | `-listen` | `:8080` | HTTP listen address |
 | `-fps` | `10` | Frame rate for the M-JPEG stream |
 | `-quality` | `80` | JPEG compression quality (1-100) |
+| `-bpp` | `32` | VNC color depth in bits per pixel (`8`, `16`, or `32`) |
 | `-config` | *(empty)* | Path to JSON configuration file |
 
 ---
@@ -64,7 +65,8 @@ You can store the configuration in a JSON file to separate credentials from your
   "password": "my-vnc-password",
   "listen": ":8080",
   "fps": 15,
-  "quality": 85
+  "quality": 85,
+  "bpp": 16
 }
 ```
 
@@ -75,37 +77,60 @@ Run the streamer:
 
 ---
 
+## Bandwidth Optimization
+
+If you need to minimize network traffic (e.g. for slow or remote connections), you can optimize bandwidth at both the VNC transport and HTTP streaming levels:
+
+1. **VNC Server-to-Streamer Bandwidth (`-bpp`):**
+   Setting `-bpp 16` drops the color depth from 32-bit (true color) to 16-bit. This halves the raw data size transferred between the VNC server and the streamer, greatly improving compression efficiency with no visible text-readability loss.
+2. **Streamer-to-Browser Bandwidth (`-fps` and `-quality`):**
+   - **Lower the FPS:** Reducing frame rate (e.g. `-fps 5` or `-fps 3`) drastically reduces HTTP stream throughput.
+   - **Lower the JPEG Quality:** Dropping quality to `-quality 50` or `-quality 40` compresses the MJPEG frames significantly while keeping the visual output clean enough for server monitoring.
+
+---
+
 ## NixOS Configuration
 
-This project is fully compatible with Nix flakes and includes a built-in NixOS module.
+This project is fully compatible with Nix flakes and includes a built-in multi-instance NixOS module.
 
 ### 1. Add to flake inputs
 ```nix
-inputs.vnc-stream.url = "github:yourusername/vnc-stream";
+inputs.vnc-stream.url = "github:Noodlesalat/vnc-stream";
 ```
 
-### 2. Configure NixOS module options
+### 2. Configure NixOS module options (Multi-Instance Example)
 ```nix
 { config, pkgs, inputs, ... }: {
   imports = [ inputs.vnc-stream.nixosModules.default ];
 
   services.vnc-stream = {
     enable = true;
-    host = "192.168.1.100";
-    port = 5900;
-    listen = ":8080";
-    fps = 12;
-    quality = 80;
 
-    # Specify a path containing the JSON configuration file (with the password)
-    # to avoid storing the plaintext password in the world-readable Nix Store.
-    configFile = "/run/secrets/vnc-stream-config.json";
+    instances = {
+      # First VNC Server stream (High Quality)
+      desktop = {
+        host = "192.168.1.100";
+        port = 5900;
+        listen = ":8080";
+        fps = 15;
+        quality = 80;
+        bpp = 32;
+        configFile = "/run/secrets/vnc-desktop-config.json"; # Contains VNC password
+      };
+
+      # Second VNC Server stream (Bandwidth-Optimized)
+      server-console = {
+        host = "192.168.1.101";
+        port = 5900;
+        listen = ":8081";
+        fps = 5;
+        quality = 50;
+        bpp = 16; # Switch to 16-bit color to save VNC bandwidth
+        configFile = "/run/secrets/vnc-console-config.json";
+      };
+    };
   };
 }
 ```
 
----
-
-## License
-
-This project is licensed under the MIT License.
+Each instance dynamically starts its own Systemd service: `vnc-stream-desktop.service` and `vnc-stream-server-console.service`.

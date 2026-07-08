@@ -157,7 +157,7 @@ func setVncState(conn *vnc.ClientConn, err error) {
 }
 
 // startVNCManager runs the background connection and auto-reconnection loop
-func startVNCManager(host string, port int, password string) {
+func startVNCManager(host string, port int, password string, bpp int) {
 	address := fmt.Sprintf("%s:%d", host, port)
 
 	for {
@@ -185,10 +185,20 @@ func startVNCManager(host string, port int, password string) {
 		cchClient := make(chan vnc.ClientMessage, 100)
 		errorCh := make(chan error, 10)
 
+		var pf vnc.PixelFormat
+		switch bpp {
+		case 8:
+			pf = vnc.PixelFormat8bit
+		case 16:
+			pf = vnc.PixelFormat16bit
+		default:
+			pf = vnc.PixelFormat32bit
+		}
+
 		ccflags := &vnc.ClientConfig{
 			SecurityHandlers: secHandlers,
 			DrawCursor:       true,
-			PixelFormat:      vnc.PixelFormat32bit,
+			PixelFormat:      pf,
 			ClientMessageCh:  cchClient,
 			ServerMessageCh:  cchServer,
 			Messages:         vnc.DefaultServerMessages,
@@ -383,9 +393,10 @@ type DashboardData struct {
 	Height    int
 	Connected bool
 	ErrorMsg  string
+	BPP       int
 }
 
-func handleDashboard(vncHost string, vncPort int, httpListen string, fps int) http.HandlerFunc {
+func handleDashboard(vncHost string, vncPort int, httpListen string, fps int, bpp int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -411,6 +422,7 @@ func handleDashboard(vncHost string, vncPort int, httpListen string, fps int) ht
 			Height:    hVal,
 			Connected: connected,
 			ErrorMsg:  errStr,
+			BPP:       bpp,
 		}
 
 		tmpl, err := template.New("dashboard").Parse(dashboardHTML)
@@ -433,6 +445,7 @@ type Config struct {
 	Listen   string `json:"listen"`
 	FPS      int    `json:"fps"`
 	Quality  int    `json:"quality"`
+	BPP      int    `json:"bpp"`
 }
 
 func loadConfig() (*Config, error) {
@@ -444,6 +457,7 @@ func loadConfig() (*Config, error) {
 		Listen:   ":8080",
 		FPS:      10,
 		Quality:  80,
+		BPP:      32,
 	}
 
 	// Register command-line flags
@@ -453,6 +467,7 @@ func loadConfig() (*Config, error) {
 	listenFlag := flag.String("listen", ":8080", "HTTP server address to listen on")
 	fpsFlag := flag.Int("fps", 10, "Target frame rate (Frames Per Second)")
 	qualityFlag := flag.Int("quality", 80, "JPEG compression quality (1-100)")
+	bppFlag := flag.Int("bpp", 32, "VNC color depth in bits per pixel (8, 16, or 32)")
 	configPath := flag.String("config", "", "Path to JSON configuration file")
 
 	flag.Parse()
@@ -492,6 +507,9 @@ func loadConfig() (*Config, error) {
 	if visited["quality"] {
 		cfg.Quality = *qualityFlag
 	}
+	if visited["bpp"] {
+		cfg.BPP = *bppFlag
+	}
 
 	// Sanitize and boundary check settings
 	if cfg.FPS <= 0 {
@@ -499,6 +517,9 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.Quality < 1 || cfg.Quality > 100 {
 		cfg.Quality = 80
+	}
+	if cfg.BPP != 8 && cfg.BPP != 16 && cfg.BPP != 32 {
+		cfg.BPP = 32
 	}
 
 	return cfg, nil
@@ -513,13 +534,13 @@ func main() {
 	broker := NewClientBroker()
 
 	// Launch VNC manager and periodic frame encoding goroutines
-	go startVNCManager(cfg.Host, cfg.Port, cfg.Password)
+	go startVNCManager(cfg.Host, cfg.Port, cfg.Password, cfg.BPP)
 	go startEncodingLoop(context.Background(), broker, cfg.FPS, cfg.Quality)
 
-	http.HandleFunc("/", handleDashboard(cfg.Host, cfg.Port, cfg.Listen, cfg.FPS))
+	http.HandleFunc("/", handleDashboard(cfg.Host, cfg.Port, cfg.Listen, cfg.FPS, cfg.BPP))
 	http.HandleFunc("/stream", handleStream(broker, cfg.Quality))
 
-	log.Printf("[HTTP] Stream server starting on http://localhost%s/", cfg.Listen)
+	log.Printf("[HTTP] Stream server starting on http://%s/", cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, nil); err != nil {
 		log.Fatalf("[HTTP] Server failed: %v", err)
 	}
@@ -839,6 +860,10 @@ const dashboardHTML = `<!DOCTYPE html>
                     <div class="info-row">
                         <span class="info-label">Ziel-FPS</span>
                         <span class="info-value">{{.FPS}}</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Farbtiefe (BPP)</span>
+                        <span class="info-value">{{.BPP}} bit</span>
                     </div>
                     <div class="info-row">
                         <span class="info-label">Listen Address</span>
