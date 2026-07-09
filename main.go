@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,55 +23,89 @@ import (
 
 // State management variables protected by stateMu
 var (
-	stateMu         sync.RWMutex
-	vncConnected    bool
-	vncConnErr      error
-	activeCanvas    *vnc.VncCanvas
-	vncCanvasWidth  int
-	vncCanvasHeight int
-	lastFrameBytes  []byte
+	stateMu             sync.RWMutex
+	vncConnected        bool
+	vncConnErr          error
+	activeCanvas        *vnc.VncCanvas
+	vncCanvasWidth      int
+	vncCanvasHeight     int
+	canvasUpdateCounter uint64
 )
 
-// ClientBroker broadcasts MJPEG frames to all active HTTP subscribers
+var dashboardTmpl *template.Template
+
+// ClientBroker tracks active HTTP subscribers
 type ClientBroker struct {
 	mu      sync.Mutex
-	clients map[chan []byte]bool
+	clients map[chan struct{}]bool
 }
 
 func NewClientBroker() *ClientBroker {
 	return &ClientBroker{
-		clients: make(map[chan []byte]bool),
+		clients: make(map[chan struct{}]bool),
 	}
 }
 
-func (b *ClientBroker) Register(ch chan []byte) {
+func (b *ClientBroker) Register(ch chan struct{}) {
 	b.mu.Lock()
 	b.clients[ch] = true
 	b.mu.Unlock()
 }
 
-func (b *ClientBroker) Unregister(ch chan []byte) {
+func (b *ClientBroker) Unregister(ch chan struct{}) {
 	b.mu.Lock()
 	delete(b.clients, ch)
 	b.mu.Unlock()
 }
 
-func (b *ClientBroker) Broadcast(jpegBytes []byte) {
+func (b *ClientBroker) HasSubscribers() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for ch := range b.clients {
-		select {
-		case ch <- jpegBytes:
-		default:
-			// Drop frame if client is too slow to avoid blocking other clients
-		}
-	}
+	return len(b.clients) > 0
 }
 
-// Global cached test pattern bytes
+// scaleImage scales an image to custom dimensions using Nearest Neighbor interpolation
+func scaleImage(src image.Image, w, h int) image.Image {
+	if src == nil {
+		return nil
+	}
+	bounds := src.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+	if srcW == w && srcH == h {
+		return src
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		srcY := (y * srcH) / h
+		for x := 0; x < w; x++ {
+			srcX := (x * srcW) / w
+			dst.Set(x, y, src.At(bounds.Min.X+srcX, bounds.Min.Y+srcY))
+		}
+	}
+	return dst
+}
+
+type CacheKey struct {
+	Width   int
+	Height  int
+	Quality int
+}
+
+type CachedFrame struct {
+	UpdateCounter uint64
+	Bytes         []byte
+}
+
 var (
-	testPatternBytes []byte
-	testPatternOnce  sync.Once
+	cacheMu    sync.Mutex
+	frameCache = make(map[CacheKey]CachedFrame)
+)
+
+var (
+	testPatternCacheMu sync.Mutex
+	testPatternCache   = make(map[CacheKey][]byte)
 )
 
 // generateTestPattern creates a classic television test card (SMPTE-style color bars)
@@ -124,18 +159,106 @@ func generateTestPattern(width, height int) image.Image {
 	return img
 }
 
-func getTestPattern(quality int) []byte {
-	testPatternOnce.Do(func() {
-		img := generateTestPattern(800, 600)
-		var buf bytes.Buffer
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
-			log.Printf("Error encoding test pattern: %v", err)
-			testPatternBytes = []byte{}
-			return
+func getTestPatternCached(width, height, quality int) []byte {
+	if width <= 0 {
+		width = 800
+	}
+	if height <= 0 {
+		height = 600
+	}
+	if quality <= 0 || quality > 100 {
+		quality = 80
+	}
+
+	key := CacheKey{Width: width, Height: height, Quality: quality}
+
+	testPatternCacheMu.Lock()
+	cachedBytes, found := testPatternCache[key]
+	if found {
+		testPatternCacheMu.Unlock()
+		return cachedBytes
+	}
+	testPatternCacheMu.Unlock()
+
+	// Generate and encode
+	img := generateTestPattern(width, height)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		log.Printf("Error encoding test pattern: %v", err)
+		return nil
+	}
+
+	encoded := buf.Bytes()
+	testPatternCacheMu.Lock()
+	testPatternCache[key] = encoded
+	testPatternCacheMu.Unlock()
+
+	return encoded
+}
+
+func getFrame(width, height, quality int) []byte {
+	stateMu.RLock()
+	connected := vncConnected
+	canvas := activeCanvas
+	counter := canvasUpdateCounter
+	vncW := vncCanvasWidth
+	vncH := vncCanvasHeight
+	stateMu.RUnlock()
+
+	if !connected || canvas == nil || canvas.Image == nil {
+		return getTestPatternCached(width, height, quality)
+	}
+
+	// Use original dimensions if not specified or <= 0
+	if width <= 0 {
+		width = vncW
+	}
+	if height <= 0 {
+		height = vncH
+	}
+	// Sanitize quality
+	if quality <= 0 || quality > 100 {
+		quality = 80
+	}
+
+	key := CacheKey{Width: width, Height: height, Quality: quality}
+
+	cacheMu.Lock()
+	cached, found := frameCache[key]
+	if found && cached.UpdateCounter == counter {
+		cachedBytes := cached.Bytes
+		cacheMu.Unlock()
+		return cachedBytes
+	}
+	cacheMu.Unlock()
+
+	// Cache miss or outdated: scale and encode
+	var img image.Image = canvas
+	if width != vncW || height != vncH {
+		img = scaleImage(canvas, width, height)
+	}
+
+	var buf bytes.Buffer
+	err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
+	var jpegBytes []byte
+	if err == nil {
+		jpegBytes = buf.Bytes()
+	} else {
+		log.Printf("[Encoder] Error encoding frame to JPEG: %v", err)
+		if found {
+			return cached.Bytes
 		}
-		testPatternBytes = buf.Bytes()
-	})
-	return testPatternBytes
+		return nil
+	}
+
+	cacheMu.Lock()
+	frameCache[key] = CachedFrame{
+		UpdateCounter: counter,
+		Bytes:         jpegBytes,
+	}
+	cacheMu.Unlock()
+
+	return jpegBytes
 }
 
 func setVncState(conn *vnc.ClientConn, err error) {
@@ -159,12 +282,19 @@ func setVncState(conn *vnc.ClientConn, err error) {
 // startVNCManager runs the background connection and auto-reconnection loop
 func startVNCManager(host string, port int, password string, bpp int) {
 	address := fmt.Sprintf("%s:%d", host, port)
+	wasConnected := false
+	loggedError := false
 
 	for {
-		log.Printf("[VNC] Connecting to %s...", address)
+		if !loggedError && !wasConnected {
+			log.Printf("[VNC] Connecting to %s...", address)
+		}
 		dialer, err := net.DialTimeout("tcp", address, 5*time.Second)
 		if err != nil {
-			log.Printf("[VNC] Connection failed: %v. Retrying in 5 seconds...", err)
+			if !loggedError {
+				log.Printf("[VNC] Connection failed: %v. Retrying in background...", err)
+				loggedError = true
+			}
 			setVncState(nil, err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -219,7 +349,10 @@ func startVNCManager(host string, port int, password string, bpp int) {
 		vncConnection, err := vnc.Connect(context.Background(), dialer, ccflags)
 		if err != nil {
 			dialer.Close()
-			log.Printf("[VNC] Handshake/Auth failed: %v. Retrying in 5 seconds...", err)
+			if !loggedError {
+				log.Printf("[VNC] Handshake/Auth failed: %v. Retrying in background...", err)
+				loggedError = true
+			}
 			setVncState(nil, err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -227,6 +360,8 @@ func startVNCManager(host string, port int, password string, bpp int) {
 
 		log.Printf("[VNC] Connected successfully. Resolution: %dx%d", vncConnection.Width(), vncConnection.Height())
 		setVncState(vncConnection, nil)
+		wasConnected = true
+		loggedError = false
 
 		for _, enc := range ccflags.Encodings {
 			myRenderer, ok := enc.(vnc.Renderer)
@@ -258,6 +393,9 @@ func startVNCManager(host string, port int, password string, bpp int) {
 					if !ok {
 						return
 					}
+					stateMu.Lock()
+					canvasUpdateCounter++
+					stateMu.Unlock()
 					if msg.Type() == vnc.FramebufferUpdateMsgType {
 						reqMsg := vnc.FramebufferUpdateRequest{
 							Inc:    1,
@@ -279,57 +417,40 @@ func startVNCManager(host string, port int, password string, bpp int) {
 		vncConnection.Close()
 		dialer.Close()
 		setVncState(nil, err)
+		wasConnected = false
+		loggedError = false
 
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// startEncodingLoop periodically captures and compresses VNC screen/test pattern frames to JPEG
-func startEncodingLoop(ctx context.Context, broker *ClientBroker, fps int, quality int) {
-	ticker := time.NewTicker(time.Second / time.Duration(fps))
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			var imgBytes []byte
-
-			stateMu.RLock()
-			isConnected := vncConnected
-			canvas := activeCanvas
-			stateMu.RUnlock()
-
-			if isConnected && canvas != nil && canvas.Image != nil {
-				var buf bytes.Buffer
-				// Encode canvas (including dynamic pointer coordinates and updates) to JPEG
-				err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: quality})
-				if err == nil {
-					imgBytes = buf.Bytes()
-					stateMu.Lock()
-					lastFrameBytes = imgBytes
-					stateMu.Unlock()
-				} else {
-					log.Printf("[Encoder] Error encoding canvas to JPEG: %v", err)
-				}
-			}
-
-			if imgBytes == nil {
-				// VNC is offline, stream test pattern instead
-				imgBytes = getTestPattern(quality)
-			}
-
-			broker.Broadcast(imgBytes)
-		}
-	}
-}
-
-func handleStream(broker *ClientBroker, quality int) http.HandlerFunc {
+func handleStream(broker *ClientBroker, defaultQuality int, defaultFPS int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ch := make(chan []byte, 10)
-		broker.Register(ch)
-		defer broker.Unregister(ch)
+		// Parse query parameters
+		fps := defaultFPS
+		if fpsStr := r.URL.Query().Get("fps"); fpsStr != "" {
+			if parsed, err := strconv.Atoi(fpsStr); err == nil && parsed > 0 {
+				fps = parsed
+			}
+		}
+		quality := defaultQuality
+		if qStr := r.URL.Query().Get("quality"); qStr != "" {
+			if parsed, err := strconv.Atoi(qStr); err == nil && parsed > 0 && parsed <= 100 {
+				quality = parsed
+			}
+		}
+		width := 0
+		if wStr := r.URL.Query().Get("width"); wStr != "" {
+			if parsed, err := strconv.Atoi(wStr); err == nil && parsed > 0 {
+				width = parsed
+			}
+		}
+		height := 0
+		if hStr := r.URL.Query().Get("height"); hStr != "" {
+			if parsed, err := strconv.Atoi(hStr); err == nil && parsed > 0 {
+				height = parsed
+			}
+		}
 
 		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
 		w.Header().Set("Cache-Control", "no-cache, private, max-age=0, no-transform, no-store, must-revalidate")
@@ -337,32 +458,36 @@ func handleStream(broker *ClientBroker, quality int) http.HandlerFunc {
 		w.Header().Set("Expires", "0")
 		w.Header().Set("Connection", "close")
 
-		// Send the initial frame immediately so client has a starting display
-		stateMu.RLock()
-		lastFrame := lastFrameBytes
-		isConnected := vncConnected
-		stateMu.RUnlock()
+		// Register to broker so the system knows we have active subscribers
+		ch := make(chan struct{}, 1)
+		broker.Register(ch)
+		defer broker.Unregister(ch)
 
-		if isConnected && lastFrame != nil {
-			select {
-			case ch <- lastFrame:
-			default:
-			}
-		} else {
-			select {
-			case ch <- getTestPattern(quality):
-			default:
+		// Send the initial frame immediately
+		jpegBytes := getFrame(width, height, quality)
+		if jpegBytes != nil {
+			_, err := fmt.Fprintf(w, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(jpegBytes))
+			if err == nil {
+				_, _ = w.Write(jpegBytes)
+				_, _ = w.Write([]byte("\r\n"))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
 			}
 		}
+
+		ticker := time.NewTicker(time.Second / time.Duration(fps))
+		defer ticker.Stop()
 
 		ctx := r.Context()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case jpegBytes, ok := <-ch:
-				if !ok {
-					return
+			case <-ticker.C:
+				jpegBytes := getFrame(width, height, quality)
+				if jpegBytes == nil {
+					continue
 				}
 				_, err := fmt.Fprintf(w, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(jpegBytes))
 				if err != nil {
@@ -425,14 +550,8 @@ func handleDashboard(vncHost string, vncPort int, httpListen string, fps int, bp
 			BPP:       bpp,
 		}
 
-		tmpl, err := template.New("dashboard").Parse(dashboardHTML)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := tmpl.Execute(w, data); err != nil {
+		if err := dashboardTmpl.Execute(w, data); err != nil {
 			log.Printf("Template execute error: %v", err)
 		}
 	}
@@ -531,14 +650,15 @@ func main() {
 		log.Fatalf("Configuration error: %v", err)
 	}
 
+	dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
+
 	broker := NewClientBroker()
 
 	// Launch VNC manager and periodic frame encoding goroutines
 	go startVNCManager(cfg.Host, cfg.Port, cfg.Password, cfg.BPP)
-	go startEncodingLoop(context.Background(), broker, cfg.FPS, cfg.Quality)
 
 	http.HandleFunc("/", handleDashboard(cfg.Host, cfg.Port, cfg.Listen, cfg.FPS, cfg.BPP))
-	http.HandleFunc("/stream", handleStream(broker, cfg.Quality))
+	http.HandleFunc("/stream", handleStream(broker, cfg.Quality, cfg.FPS))
 
 	log.Printf("[HTTP] Stream server starting on http://%s/", cfg.Listen)
 	if err := http.ListenAndServe(cfg.Listen, nil); err != nil {

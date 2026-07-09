@@ -37,6 +37,20 @@ Start the server using CLI arguments:
 Open `http://localhost:8080/` in a web browser to access the dashboard.
 Open `http://localhost:8080/stream` to access the raw M-JPEG stream (useful in external players or home automation platforms like Home Assistant).
 
+### Dynamic Stream Parameters (URL Query)
+
+You can dynamically customize the stream properties (resolution, quality, frame rate) per HTTP client using URL query parameters:
+
+- `fps`: Target frame rate (e.g. `?fps=5`). Defaults to configured server FPS.
+- `quality`: JPEG quality between `1` and `100` (e.g. `?quality=60`). Defaults to configured server quality.
+- `width`: Rescales the width of the stream in pixels (e.g. `?width=640`). Defaults to native VNC resolution.
+- `height`: Rescales the height of the stream in pixels (e.g. `?height=480`). Defaults to native VNC resolution.
+
+Example:
+```
+http://localhost:8080/stream?width=800&height=600&quality=60&fps=5
+```
+
 ### CLI Parameters
 
 | Flag | Default | Description |
